@@ -53,6 +53,7 @@ logs.txt
 *.tmp
 *.bak
 *.cache
+.venv
 
 browser_data
 browser_data_rt
