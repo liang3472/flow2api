@@ -439,6 +439,14 @@ class Config:
             return 5.0
 
     @property
+    def browser_inject_block_media(self) -> bool:
+        """脚本注入打码：是否拦截图片/视频/字体等重资源以加速页面加载。"""
+        value = self._config.get("captcha", {}).get("browser_inject_block_media", True)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    @property
     def browser_idle_ttl_seconds(self) -> int:
         value = self._config.get("captcha", {}).get("browser_idle_ttl_seconds", 600)
         try:

@@ -144,6 +144,13 @@ def _ensure_playwright_installed() -> bool:
 
 def _ensure_browser_installed() -> bool:
     """确保 chromium 浏览器已安装"""
+    custom_browser = os.environ.get("BROWSER_EXECUTABLE_PATH", "").strip()
+    if custom_browser and os.path.exists(custom_browser):
+        debug_logger.log_info(
+            f"[BrowserCaptcha] 使用外部浏览器，跳过 playwright chromium 安装: {custom_browser}"
+        )
+        return True
+
     try:
         detect_script = (
             "from playwright.sync_api import sync_playwright\n"
@@ -277,6 +284,92 @@ def validate_browser_proxy_url(proxy_url: str) -> tuple[bool, str]:
     parsed = parse_proxy_url(normalized_proxy_url)
     if not parsed: return False, "代理格式错误"
     return True, None
+
+
+# Flow 注入打码：拦截重资源，保留页面脚本 / reCAPTCHA / labs API
+_FLOW_INJECT_BLOCKED_RESOURCE_TYPES = frozenset({
+    "image",
+    "media",
+    "font",
+    "texttrack",
+})
+_FLOW_INJECT_MEDIA_URL_SUFFIXES = (
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg", ".ico", ".bmp",
+    ".mp4", ".webm", ".mov", ".m4v", ".ogv", ".ogg", ".mp3", ".wav", ".m4a",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+)
+_FLOW_INJECT_MEDIA_HOST_FRAGMENTS = (
+    "googleusercontent.com",
+    "ggpht.com",
+    "storage.googleapis.com",
+    "googlevideo.com",
+    "ytimg.com",
+)
+
+FLOW_INJECT_BLOCK_MEDIA_INIT_SCRIPT = """
+(() => {
+    const emptyGif = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+    const stripMedia = (root) => {
+        if (!root || !root.querySelectorAll) return;
+        root.querySelectorAll('img, picture source, video, audio').forEach((el) => {
+            try {
+                if (el.tagName === 'IMG' && el.src && !el.src.startsWith('data:')) {
+                    el.src = emptyGif;
+                    el.srcset = '';
+                } else if (el.tagName === 'SOURCE') {
+                    el.src = '';
+                } else if (el.tagName === 'VIDEO' || el.tagName === 'AUDIO') {
+                    el.removeAttribute('src');
+                    el.pause && el.pause();
+                }
+            } catch (e) {}
+        });
+    };
+    stripMedia(document);
+    const observer = new MutationObserver((records) => {
+        for (const record of records) {
+            record.addedNodes.forEach((node) => {
+                if (node.nodeType !== 1) return;
+                if (node.matches && node.matches('img, video, audio, picture, source')) {
+                    stripMedia(node.parentNode || document);
+                } else {
+                    stripMedia(node);
+                }
+            });
+        }
+    });
+    observer.observe(document.documentElement || document, { childList: true, subtree: true });
+})();
+""".strip()
+
+
+def _flow_inject_url_looks_like_media(url: str) -> bool:
+    path = (url or "").split("?", 1)[0].lower()
+    return any(path.endswith(suffix) for suffix in _FLOW_INJECT_MEDIA_URL_SUFFIXES)
+
+
+def _flow_inject_should_abort_request(request) -> bool:
+    """判断 Flow 注入打码是否应拦截该请求（仅保留打码所需资源）。"""
+    resource_type = getattr(request, "resource_type", "") or ""
+    url = (getattr(request, "url", None) or "").lower()
+
+    if resource_type in ("document", "script"):
+        return False
+
+    if resource_type in _FLOW_INJECT_BLOCKED_RESOURCE_TYPES:
+        return True
+
+    if resource_type == "websocket":
+        return True
+
+    if _flow_inject_url_looks_like_media(url):
+        return True
+
+    if any(fragment in url for fragment in _FLOW_INJECT_MEDIA_HOST_FRAGMENTS):
+        return True
+
+    return False
+
 
 class TokenBrowser:
     """简化版浏览器：每次获取 token 时启动新浏览器，用完即关
@@ -1213,6 +1306,10 @@ class TokenBrowser:
             page = await context.new_page()
             await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
 
+            block_media = bool(getattr(config, "browser_inject_block_media", True))
+            if block_media:
+                await page.add_init_script(FLOW_INJECT_BLOCK_MEDIA_INIT_SCRIPT)
+
             primary_url, secondary_url = enterprise_script_urls(
                 website_key,
                 use_recaptcha_net=self._browser_proxy_active,
@@ -1220,8 +1317,18 @@ class TokenBrowser:
             wait_expression = build_enterprise_wait_expression()
 
             debug_logger.log_info(
-                f"[BrowserCaptcha] Token-{self.token_id} 脚本注入打码: url={website_url}, action={action}"
+                f"[BrowserCaptcha] Token-{self.token_id} 脚本注入打码: url={website_url}, action={action}, block_media={block_media}"
             )
+
+            blocked_media_count = 0
+
+            async def handle_inject_route(route):
+                nonlocal blocked_media_count
+                if block_media and _flow_inject_should_abort_request(route.request):
+                    blocked_media_count += 1
+                    await route.abort()
+                    return
+                await route.continue_()
 
             def handle_request_failed(request):
                 try:
@@ -1235,6 +1342,8 @@ class TokenBrowser:
                 except Exception:
                     pass
 
+            if block_media:
+                await page.route("**/*", handle_inject_route)
             page.on("requestfailed", handle_request_failed)
 
             try:
@@ -1244,6 +1353,11 @@ class TokenBrowser:
                     f"[BrowserCaptcha] Token-{self.token_id} Flow 项目页加载失败: {type(e).__name__}: {str(e)[:200]}"
                 )
                 return None
+
+            if block_media and blocked_media_count > 0:
+                debug_logger.log_info(
+                    f"[BrowserCaptcha] Token-{self.token_id} 注入打码已拦截 {blocked_media_count} 个图片/视频/字体等资源请求"
+                )
 
             warmup_seconds = float(getattr(config, "browser_inject_warmup_seconds", 5) or 5)
             if warmup_seconds > 0:
